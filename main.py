@@ -2,10 +2,6 @@ import discord
 from discord.ext import commands
 import os
 
-from pythonnet import load
-
-load("coreclr")  # or "netfx" for .NET Framework — must be called before import clr
-
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,6 +25,20 @@ async def reload_modules(ctx: commands.Context) -> None:
     """Reload modules"""
     await bot.reload_extension("pb_commands")
     await ctx.send(f"Modules reloaded")
+
+@bot.command()
+@commands.is_owner()
+async def unload_modules(ctx: commands.Context) -> None:
+    """Reload modules"""
+    await bot.unload_extension("pb_commands")
+    await ctx.send(f"Modules unloaded")
+
+@bot.command()
+@commands.is_owner()
+async def load_modules(ctx: commands.Context) -> None:
+    """Reload modules"""
+    await bot.load_extension("pb_commands")
+    await ctx.send(f"Modules unloaded")
 
 
 @bot.event
