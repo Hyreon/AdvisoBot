@@ -36,10 +36,10 @@ def advance_time(pitboss):
 
 def any_advance(bot, pitboss):
     # FIXME include a check that all turns are done, which always allows advancing the turn
-    if bot.holidays:
+    if bot.config["holidays"]:
         return False
     time_is_up = datetime.datetime.now() > advance_time(pitboss)
-    return time_is_up and not pitboss.dummy_is_admin
+    return time_is_up and pitboss.allow_any_advance
 
 
 class MyLayoutView(discord.ui.LayoutView):
@@ -48,6 +48,8 @@ class MyLayoutView(discord.ui.LayoutView):
     def expiry_string(self):
         try:
             player_taking_turn = current_player(self.pitboss)
+            players_list = list(self.pitboss.get_Players())
+            last_player = players_list[-1]
             if player_taking_turn:
                 member = self.channel.guild.get_member_named(player_taking_turn)
                 if member:
@@ -62,8 +64,10 @@ class MyLayoutView(discord.ui.LayoutView):
                 return f"/pb-advance to advance the turn"
             elif self.pitboss.advance_delay or self.pitboss.auto_advance_delay:
                 return f"Turn advance unlocked {discord.utils.format_dt(advance_time(self.pitboss), "R")}"
-            elif self.bot.holidays:
+            elif self.bot.config["holidays"]:
                 return f"Happy holidays!"
+            elif last_player:
+                return f"Turns advanced manually by {last_player}"
             else:
                 return f"Turns advanced manually by staff"
         except Exception as e:
@@ -93,9 +97,14 @@ class MyLayoutView(discord.ui.LayoutView):
 
     async def update(self):
         section = self.container.children[0]
-        section.children[0].content = f"## Turn {self.pitboss.get_CurrentTurn()}"
-        section.children[1].content = "### " + self.expiry_string()
-        section.children[2].content = f"{list(self.pitboss.get_HumanPlayers())} {list(self.pitboss.get_TurnTaken())}"
+        # section.children[0].content = f"## Turn {self.pitboss.get_CurrentTurn()}"
+        section.children[0].content = f"### Turn {self.pitboss.get_CurrentTurn()}: " + self.expiry_string()
+        players_played, players_unplayed = [], []
+        players = list(self.pitboss.get_Players())
+        for i,turn_taken in enumerate(list(self.pitboss.get_TurnTaken())):
+            (players_unplayed, players_played)[turn_taken].append(players[i])
+        section.children[1].content = f"Taken: {players_played}"
+        section.children[2].content = f"Not taken: {players_unplayed}"
         await self.message.edit(view=self)
 
     # checks for the view's interactions
@@ -157,16 +166,8 @@ class DurationConverter(app_commands.Transformer):
             raise commands.BadArgument("Invalid duration provided.")
 
 
-# returns a copy of the array where None is replaced with '#XX', making CPU players playable with permissions
 def adjust_names(names: list[str]) -> list[str]:
-    adjusted_names = []
-    for i, name in enumerate(names):
-        if name:
-            adjusted_names.append(name)
-        else:
-            adjusted_names.append(f"#{i + 1}")
-    return adjusted_names
-
+    return names
 
 def make_pitboss(file_bytes, names):
     pitboss = PitBossOrganizer(file_bytes, adjust_names(names))
@@ -175,10 +176,10 @@ def make_pitboss(file_bytes, names):
     pitboss.advance_delay = None
     pitboss.auto_advance_delay = datetime.timedelta(days=6, hours=6)
     pitboss.last_advance = datetime.datetime.now()
-    pitboss.cpu_is_admin = True
-    pitboss.dummy_is_admin = False
+    pitboss.allow_any_cpu = False
+    pitboss.allow_any_advance = True
 
-    for i,name in names:
+    for i,name in enumerate(names):
         if name is None:
             while not pitboss.ToggleDefaultAI(i):
                 pass
@@ -189,14 +190,15 @@ def current_player(pitboss: PitBossOrganizer):
     index = pitboss.get_CurrentPlayer()
     if index is None or index < 0:
         return None
-    players = list(pitboss.get_HumanPlayers())
+    players = list(pitboss.get_Players())
     if index >= len(players):
         return "dummy"
     return players[index]
 
 
 def get_turn_name(pitboss: PitBossOrganizer, channel_name: str, ext: str = ".SAV") -> str:
-    return f"{channel_name}-{pitboss.get_CurrentTurn()}-{current_player(pitboss)}" + ext
+    turn_number = '{0:03}'.format(pitboss.get_CurrentTurn())
+    return f"{channel_name}-{turn_number}-{current_player(pitboss)}" + ext
 
 
 def get_claim_label(pitboss: PitBossOrganizer):
@@ -231,7 +233,7 @@ async def auto_expire_with_notification(pitboss: PitBossOrganizer, user: discord
 
 async def update_pitboss(pitboss, protogame, messages):
     if pitboss:
-        existing_players = pitboss.get_HumanPlayers()
+        existing_players = pitboss.get_Players()
         if len(existing_players) == len(protogame):
             set_player_order(pitboss, protogame)
         else:
@@ -257,31 +259,39 @@ class PitBossCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    async def claim_for(self, interaction: discord.Interaction, user: discord.User = None, cpu_slot: int = None):
+    async def claim_for(self, interaction: discord.Interaction, user: discord.User = None, cpu_slot = None):
+        print("claiming for")
         username = None
         if cpu_slot:
-            protogame = self.bot.protogames.get(interaction.channel_id, None)
-            if not protogame:
-                await interaction.response.send_message("There is no queue in this channel!")
+            pitboss = self.bot.games.get(interaction.channel_id, None)
+            if not pitboss:
+                await interaction.response.send_message("There is no game in this channel!")
                 return
-            elif protogame[cpu_slot-1] is None:
-                username = f"#{cpu_slot}"
-            else:
+            if pitboss.get_Anarchy and not isinstance(cpu_slot, int):
+                username = cpu_slot
+            elif not pitboss.get_Anarchy and isinstance(cpu_slot, int) and list(pitboss.get_Players())[cpu_slot-1] is not None:
                 await interaction.response.send_message("That's a player, not a CPU.")
                 return
+            print("cpu slot confirmed")
         elif user:
             username = user.name
         pitboss = self.bot.games.get(interaction.channel_id, None)
+        print("found the game")
         if not pitboss:
             await interaction.response.send_message("There is no game in this channel!")
+            return
         else:
+            print("defining the game as none")
             game = None
             try:
                 await interaction.response.defer()
-                if username:
+                print("deferred")
+                if cpu_slot:
+                    game = bytes(pitboss.GetConfiguredTurn(cpu_slot))
+                elif username:
                     game = bytes(pitboss.GetConfiguredTurn(username))
                 else:
-                    game = bytes(pitboss.GetDummyTurn())
+                    game = bytes(pitboss.GetConfiguredTurn())
 
                 file = None
                 if len(game) >= 10 * 1024 * 1024:  # 10 MiB
@@ -313,29 +323,14 @@ class PitBossCommands(commands.Cog):
                 with open("problem_save.SAV", "w+b") as f:
                     f.write(game)
 
-    # FIXME adding other players ADMIN ONLY
-    # swapping is a bit suspicious, there's got to be some safeties against it, but for now is fine
-    # actually so is joining in whatever slot you like, you can boot someone out of the game that way
-    @app_commands.command(name="pb-register",
-                          description="Sign up for a PitBoss game on this channel, or switch to a different slot if already signed up")
-    @app_commands.describe(slot="The desired player slot.",
-                           player="The player you're adding (leave blank for yourself)")
-    async def register(self, interaction: discord.Interaction, slot: int = 0, player: discord.User = None) -> None:
+    async def add_player(self, interaction: discord.Interaction, slot: int = 0, value: str = None) -> None:
         try:
             messages = []
+            pitboss = self.bot.games.get(interaction.channel_id)
             slot -= 1  # 1 indexed to 0 indexed
-            value = interaction.user.name
-            if player:
-                if interaction.permissions.manage_events:
-                    value = player.name
-                else:
-                    await interaction.response.send_message(
-                        f"You're not allowed to register other players! Only hosts can do that.")
-                    return
             if not self.bot.protogames.get(interaction.channel_id):
                 self.bot.protogames[interaction.channel_id] = []
             protogame = self.bot.protogames[interaction.channel_id]
-            pitboss = self.bot.games.get(interaction.channel_id)
             if value in protogame:
                 if slot < 0:
                     await interaction.response.send_message(
@@ -365,6 +360,31 @@ class PitBossCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"Something went wrong. {e}")
             print(traceback.format_exc())
+
+    @app_commands.command(name="pb-register-civ",
+                          description="Register under an arbitrary name")
+    @app_commands.describe(slot="The desired player slot.",
+                           alias="The name you're adding")
+    async def register(self, interaction: discord.Interaction, slot: int, alias: str) -> None:
+        await self.add_player(interaction, slot, alias)
+
+    # FIXME some of this should be admin-only.
+    #  swapping is a bit suspicious, there's got to be some safeties against it, but for now is fine
+    #  actually so is joining in whatever slot you like, you can boot someone out of the game that way
+    @app_commands.command(name="pb-register",
+                          description="Sign up for a PitBoss game on this channel, or switch to a different slot if already signed up")
+    @app_commands.describe(slot="The desired player slot.",
+                           player="The player you're adding (leave blank for yourself)")
+    async def register_player(self, interaction: discord.Interaction, slot: int = 0, player: discord.User = None) -> None:
+        username = interaction.user.name
+        if player:
+            if interaction.permissions.manage_events:
+                username = player.name
+            else:
+                await interaction.response.send_message(
+                    f"You're not allowed to register other players! Only hosts can do that.")
+                return
+        await self.add_player(interaction, slot, username)
 
     # FIXME removing other players ADMIN ONLY
     @app_commands.command(name="pb-leave", description="Exit the PitBoss game on this channel.")
@@ -441,19 +461,6 @@ class PitBossCommands(commands.Cog):
                 await interaction.response.send_message(
                     f"You're not allowed to advance the turn at this time")
 
-    @app_commands.command(name="pb-toggle-stick-the-dealer",
-                          description="Toggle whether the last player is a dummy or a player that has to go last")
-    @app_commands.describe()
-    async def toggle_stick_the_dealer(self, interaction: discord.Interaction):
-        pitboss = self.bot.games.get(interaction.channel_id, None)
-        if not pitboss:
-            await interaction.response.send_message("There is no game in this channel!")
-        else:
-            if pitboss.ToggleLastPlayerHuman():
-                await interaction.response.send_message("The last player is now a **human** player")
-            else:
-                await interaction.response.send_message("The last player is now a **dummy** player")
-
     @has_permissions(manage_events=True)
     @default_permissions(manage_events=True)
     @app_commands.command(name="pb-toggle-admin-dummy",
@@ -463,14 +470,28 @@ class PitBossCommands(commands.Cog):
         pitboss = self.bot.games.get(interaction.channel_id, None)
         if not pitboss:
             await interaction.response.send_message("There is no game in this channel!")
-        elif pitboss.get_LastPlayerHuman():
-            await interaction.response.send_message("The last player is a human!")
         else:
-            pitboss.dummy_is_admin = not pitboss.dummy_is_admin
-            if pitboss.dummy_is_admin:
-                await interaction.response.send_message("**Admins only** can now play the dummy player")
+            pitboss.allow_any_advance = not pitboss.allow_any_advance
+            if not pitboss.allow_any_advance:
+                await interaction.response.send_message("**Admins only** can now play the last player")
             else:
-                await interaction.response.send_message("**Anyone** can now play the dummy player")
+                await interaction.response.send_message("**Anyone** can now play the last player")
+
+    @has_permissions(manage_events=True)
+    @default_permissions(manage_events=True)
+    @app_commands.command(name="pb-toggle-anarchy",
+                          description="Enable complete anarchy")
+    @app_commands.describe(anarchy="Whether to enable or disable anarchy.")
+    async def set_anarchy(self, interaction: discord.Interaction, anarchy: bool):
+        pitboss = self.bot.games.get(interaction.channel_id, None)
+        if not pitboss:
+            await interaction.response.send_message("There is no game in this channel!")
+        else:
+            pitboss.SetAnarchy(anarchy)
+            if pitboss.get_Anarchy:
+                await interaction.response.send_message("**Anarchy enabled.** Anything goes.")
+            else:
+                await interaction.response.send_message("**Anarchy disabled.** Sanity checks are in place.")
 
     @has_permissions(manage_events=True)
     @default_permissions(manage_events=True)
@@ -482,22 +503,24 @@ class PitBossCommands(commands.Cog):
         if not pitboss:
             await interaction.response.send_message("There is no game in this channel!")
         else:
-            pitboss.cpu_is_admin = not pitboss.cpu_is_admin
-            if pitboss.cpu_is_admin:
+            pitboss.allow_any_cpu = not pitboss.allow_any_cpu
+            if not pitboss.allow_any_cpu:
                 await interaction.response.send_message("**Admins only** can now play CPUs.")
             else:
                 await interaction.response.send_message("**Anyone** can now play CPUs.")
 
 
     @app_commands.command(name="pb-take", description="Get the save file to take your turn!")
-    async def take(self, interaction: discord.Interaction, cpu_slot: int = None) -> None:
+    async def take(self, interaction: discord.Interaction, slot: str = None) -> None:
 
         pitboss = self.bot.games.get(interaction.channel_id, None)
         if not pitboss:
             await interaction.response.send_message("There is no game in this channel!")
         else:
-            if cpu_slot is None or not pitboss.cpu_is_admin or interaction.permissions.manage_events:
-                await self.claim_for(interaction, interaction.user, cpu_slot)
+            print("checking cpu_slot")
+            if slot is None or pitboss.allow_any_cpu or interaction.permissions.manage_events:
+                print("cpu slot confirmed")
+                await self.claim_for(interaction, interaction.user, slot)
             else:
                 await interaction.response.send_message(
                     f"You're not allowed to play CPU turns at this time.")
@@ -519,7 +542,7 @@ class PitBossCommands(commands.Cog):
         else:
             await interaction.response.defer()
             try:
-                if pitboss.get_CurrentPlayer() == len(pitboss.get_HumanPlayers()):
+                if pitboss.get_CurrentPlayer() == len(pitboss.get_Players()):
                     pitboss.ReceiveDummyTurn(await game.read())
                 else:
                     pitboss.ReceiveNewTurn(await game.read())
@@ -552,13 +575,17 @@ class PitBossCommands(commands.Cog):
     @app_commands.describe()
     async def expire(self, interaction: discord.Interaction) -> None:
         pitboss = self.bot.games.get(interaction.channel_id, None)
-        if not pitboss:
-            await interaction.response.send_message("There is no game in this channel!")
-        else:
-            previous_player = current_player(pitboss)
-            unlock_save(pitboss)
-            await interaction.response.send_message(
-                f"The turn of {previous_player} has expired. Anyone may take the turn.")
+        try:
+            if not pitboss:
+                await interaction.response.send_message("There is no game in this channel!")
+            else:
+                previous_player = current_player(pitboss)
+                unlock_save(pitboss)
+                await interaction.response.send_message(
+                    f"The turn of {previous_player} has expired. Anyone may take the turn.")
+        except Exception as e:
+            await interaction.response.send_message(f"Something went wrong. {e}")
+            print(traceback.format_exc())
 
     @app_commands.command(name="pb-toggle-cpu-sub", description="Toggle whether the default CPU will take your skipped turns")
     @app_commands.describe()
@@ -567,7 +594,7 @@ class PitBossCommands(commands.Cog):
         if not pitboss:
             await interaction.response.send_message("There is no game in this channel!")
         else:
-            players = pitboss.get_HumanPlayers()
+            players = pitboss.get_Players()
             index = players.index(interaction.user.name)
             result = pitboss.ToggleDefaultAI(index)
             if result:
@@ -623,8 +650,8 @@ class PitBossCommands(commands.Cog):
                           description="Disables advancing turns server-wide")
     @app_commands.describe()
     async def toggle_holiday(self, interaction: discord.Interaction) -> None:
-        self.bot.holidays = not self.bot.holidays
-        if self.bot.holidays:
+        self.bot.config["holidays"] = not self.bot.config["holidays"]
+        if self.bot.config["holidays"]:
             await interaction.response.send_message(
                 "Holiday mode enabled.\n-# Turns cannot be advanced unless all other players have taken their turns.")
         else:
